@@ -46,6 +46,9 @@ pub struct TransportConfig {
     pub(crate) keep_alive_interval: Option<Duration>,
     pub(crate) crypto_buffer_size: usize,
     pub(crate) allow_spin: bool,
+    pub(crate) unspun_spin_bit: Option<bool>,
+    pub(crate) send_ecn: bool,
+    pub(crate) keep_alive_with_open_streams_only: bool,
     pub(crate) datagram_receive_buffer_size: Option<usize>,
     pub(crate) datagram_send_buffer_size: usize,
     #[cfg(test)]
@@ -277,6 +280,17 @@ impl TransportConfig {
         self
     }
 
+    /// Whether keep-alive packets are sent only while a bidirectional stream is open
+    ///
+    /// When `true`, the [`keep_alive_interval()`](Self::keep_alive_interval) timer sends nothing
+    /// while every bidirectional stream is closed, so an idle connection is left to time out (as
+    /// HTTP/3 clients do: unidirectional control streams stay open for the connection's
+    /// lifetime). Defaults to `false`.
+    pub fn keep_alive_with_open_streams_only(&mut self, value: bool) -> &mut Self {
+        self.keep_alive_with_open_streams_only = value;
+        self
+    }
+
     /// Maximum quantity of out-of-order crypto layer data to buffer
     pub fn crypto_buffer_size(&mut self, value: usize) -> &mut Self {
         self.crypto_buffer_size = value;
@@ -289,6 +303,24 @@ impl TransportConfig {
     /// be useful for network administration but sacrifices a small amount of privacy.
     pub fn allow_spin(&mut self, value: bool) -> &mut Self {
         self.allow_spin = value;
+        self
+    }
+
+    /// The spin bit sent while the spin bit is not in use on a connection
+    ///
+    /// `None` (the default) sends a random value in every short-header packet, as RFC 9000
+    /// section 17.4 recommends; `Some(value)` sends `value` in all of them.
+    pub fn unspun_spin_bit(&mut self, value: Option<bool>) -> &mut Self {
+        self.unspun_spin_bit = value;
+        self
+    }
+
+    /// Whether outgoing packets are marked ECN-capable (ECT(0))
+    ///
+    /// Defaults to `true`; marking stops anyway on paths where ECN validation fails. With `false`
+    /// every datagram is sent Not-ECT.
+    pub fn send_ecn(&mut self, value: bool) -> &mut Self {
+        self.send_ecn = value;
         self
     }
 
@@ -491,6 +523,9 @@ impl Default for TransportConfig {
             keep_alive_interval: None,
             crypto_buffer_size: 16 * 1024,
             allow_spin: true,
+            unspun_spin_bit: None,
+            send_ecn: true,
+            keep_alive_with_open_streams_only: false,
             datagram_receive_buffer_size: Some(STREAM_RWND as usize),
             datagram_send_buffer_size: 1024 * 1024,
             #[cfg(test)]
@@ -536,6 +571,9 @@ impl fmt::Debug for TransportConfig {
             keep_alive_interval,
             crypto_buffer_size,
             allow_spin,
+            unspun_spin_bit,
+            send_ecn,
+            keep_alive_with_open_streams_only,
             datagram_receive_buffer_size,
             datagram_send_buffer_size,
             #[cfg(test)]
@@ -576,6 +614,12 @@ impl fmt::Debug for TransportConfig {
             .field("keep_alive_interval", keep_alive_interval)
             .field("crypto_buffer_size", crypto_buffer_size)
             .field("allow_spin", allow_spin)
+            .field("unspun_spin_bit", unspun_spin_bit)
+            .field("send_ecn", send_ecn)
+            .field(
+                "keep_alive_with_open_streams_only",
+                keep_alive_with_open_streams_only,
+            )
             .field("datagram_receive_buffer_size", datagram_receive_buffer_size)
             .field("datagram_send_buffer_size", datagram_send_buffer_size)
             // congestion_controller_factory not debug

@@ -915,6 +915,16 @@ impl StreamsState {
         Ok(())
     }
 
+    /// Whether a bidirectional stream is open in either direction
+    pub(crate) fn has_open_bidi_streams(&self) -> bool {
+        self.send
+            .iter()
+            .any(|(id, stream)| id.dir() == Dir::Bi && stream.is_some())
+            || self.recv.iter().any(|(id, stream)| {
+                id.dir() == Dir::Bi && stream.as_ref().is_some_and(|s| s.as_open_recv().is_some())
+            })
+    }
+
     /// Whether a locally initiated stream has never been open
     pub(crate) fn is_local_unopened(&self, id: StreamId) -> bool {
         id.index() >= self.next[id.dir() as usize]

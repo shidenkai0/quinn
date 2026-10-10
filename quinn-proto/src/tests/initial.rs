@@ -495,3 +495,123 @@ fn max_ack_delay() {
         Duration::from_millis(20)
     );
 }
+
+/// Drive the pair until it is idle, returning every client datagram with its ECN codepoint
+fn drive_capturing(pair: &mut Pair) -> Vec<(Option<EcnCodepoint>, Bytes)> {
+    let mut datagrams = Vec::new();
+    for _ in 0..1000 {
+        pair.client.drive(pair.time, pair.server.addr);
+        datagrams.extend(
+            pair.client
+                .outbound
+                .iter()
+                .map(|(transmit, data)| (transmit.ecn, data.clone())),
+        );
+        if !pair.step() {
+            break;
+        }
+    }
+    datagrams
+}
+
+/// Spin bits of the client's short-header packets while it sends 40 stream writes
+fn client_spin_bits(transport: TransportConfig) -> Vec<bool> {
+    let mut pair = Pair::default();
+    let (client_ch, _) = pair.connect_with(client_config_with(transport));
+    let stream = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    let mut bits = Vec::new();
+    for _ in 0..40 {
+        pair.client_send(client_ch, stream)
+            .write(&[0; 100])
+            .unwrap();
+        bits.extend(
+            drive_capturing(&mut pair)
+                .iter()
+                .filter(|(_, data)| data[0] & 0x80 == 0)
+                .map(|(_, data)| data[0] & 0x20 != 0),
+        );
+    }
+    bits
+}
+
+#[test]
+fn unspun_spin_bit() {
+    let _guard = subscribe();
+    let mut transport = TransportConfig::default();
+    transport.allow_spin(false).unspun_spin_bit(Some(false));
+    let bits = client_spin_bits(transport);
+    assert!(bits.len() >= 40, "{}", bits.len());
+    assert!(bits.iter().all(|&bit| !bit), "{bits:?}");
+
+    let mut transport = TransportConfig::default();
+    transport.allow_spin(false);
+    let bits = client_spin_bits(transport);
+    assert!(
+        bits.contains(&true) && bits.contains(&false),
+        "random: {bits:?}"
+    );
+}
+
+#[test]
+fn send_ecn() {
+    let _guard = subscribe();
+    for send in [true, false] {
+        let mut transport = TransportConfig::default();
+        transport.send_ecn(send);
+        let mut pair = Pair::default();
+        let client_ch = pair.begin_connect(client_config_with(transport));
+        let mut datagrams = drive_capturing(&mut pair);
+        let server_ch = pair.server.assert_accept();
+        pair.finish_connect(client_ch, server_ch);
+        let stream = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+        pair.client_send(client_ch, stream)
+            .write(&[0; 100])
+            .unwrap();
+        datagrams.extend(drive_capturing(&mut pair));
+        if send {
+            assert!(
+                datagrams
+                    .iter()
+                    .all(|(ecn, _)| *ecn == Some(EcnCodepoint::Ect0))
+            );
+        } else {
+            assert!(
+                datagrams.iter().all(|(ecn, _)| ecn.is_none()),
+                "every datagram is Not-ECT"
+            );
+        }
+    }
+}
+
+/// Run a good while past the idle timeout with an open stream; whether the client survived
+fn survives_idle(open: Dir) -> bool {
+    const IDLE_TIMEOUT: u64 = 10;
+    let mut transport = TransportConfig::default();
+    transport
+        .max_idle_timeout(Some(VarInt(IDLE_TIMEOUT).into()))
+        .keep_alive_interval(Some(Duration::from_millis(IDLE_TIMEOUT / 2)))
+        .keep_alive_with_open_streams_only(true);
+    let mut pair = Pair::default();
+    let (client_ch, _) = pair.connect_with(client_config_with(transport));
+    let stream = pair.client_streams(client_ch).open(open).unwrap();
+    pair.client_send(client_ch, stream).write(b"open").unwrap();
+    let end = pair.time + Duration::from_millis(20 * IDLE_TIMEOUT);
+    while pair.time < end && !pair.client_conn_mut(client_ch).is_closed() {
+        if !pair.step() {
+            match min_opt(pair.client.next_wakeup(), pair.server.next_wakeup()) {
+                Some(time) => pair.time = time,
+                None => break,
+            }
+        }
+    }
+    !pair.client_conn_mut(client_ch).is_closed()
+}
+
+#[test]
+fn keep_alive_with_open_streams_only() {
+    let _guard = subscribe();
+    // An open request stream keeps the connection alive
+    assert!(survives_idle(Dir::Bi));
+    // Unidirectional streams (HTTP/3's control streams) alone do not
+    assert!(!survives_idle(Dir::Uni));
+}

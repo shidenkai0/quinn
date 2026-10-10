@@ -70,7 +70,7 @@ impl PathData {
         Self {
             remote,
             rtt: RttEstimator::new(config.initial_rtt),
-            sending_ecn: true,
+            sending_ecn: config.send_ecn,
             pacing: Pacer::new(
                 config.initial_rtt,
                 congestion.initial_window(),

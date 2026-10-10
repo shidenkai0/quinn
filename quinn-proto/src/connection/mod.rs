@@ -1246,8 +1246,14 @@ impl Connection {
                     self.kill(ConnectionError::TimedOut);
                 }
                 Timer::KeepAlive => {
-                    trace!("sending keep-alive");
-                    self.ping();
+                    if self.config.keep_alive_with_open_streams_only
+                        && !self.streams.has_open_bidi_streams()
+                    {
+                        trace!("no keep-alive: no open bidirectional stream");
+                    } else {
+                        trace!("sending keep-alive");
+                        self.ping();
+                    }
                 }
                 Timer::LossDetection => {
                     self.on_loss_detection_timeout(now);
@@ -3125,6 +3131,7 @@ impl Connection {
                 &self.config,
             )
         };
+        new_path.sending_ecn &= self.config.send_ecn;
         new_path.challenge = Some(self.rng.random());
         new_path.challenge_pending = true;
         let prev_pto = self.pto(SpaceId::Data);

@@ -103,7 +103,10 @@ impl PacketBuilder {
                 spin: if conn.spin_enabled {
                     conn.spin
                 } else {
-                    conn.rng.random()
+                    match conn.config.unspun_spin_bit {
+                        Some(value) => value,
+                        None => conn.rng.random(),
+                    }
                 },
                 key_phase: conn.key_phase,
             },
