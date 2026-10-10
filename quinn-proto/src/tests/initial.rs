@@ -135,11 +135,19 @@ fn first_packet_number_and_lengths() {
     pair.time = pair.client.next_wakeup().unwrap();
     pair.client.drive(pair.time, pair.server.addr);
     let second = pair.client.outbound.front().unwrap().1.clone();
+    // ... and the next PTO retransmission keeps the last configured length
+    pair.client.outbound.clear();
+    pair.time = pair.client.next_wakeup().unwrap();
+    pair.client.drive(pair.time, pair.server.addr);
+    let third = pair.client.outbound.front().unwrap().1.clone();
     let odcid = initial_dcid(&first);
     let first = client_initials_with(&first, Some(odcid));
     let second = client_initials_with(&second, Some(odcid));
     assert_eq!((first[0].number, first[0].number_len), (1, 1));
     assert_eq!((second[0].number, second[0].number_len), (2, 2));
+    let third = client_initials_with(&third, Some(odcid));
+    assert!(third[0].number >= 3);
+    assert_eq!(third[0].number_len, 2);
 
     pair.drive();
     let server_ch = pair.server.assert_accept();

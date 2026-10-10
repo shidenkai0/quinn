@@ -380,12 +380,21 @@ impl TransportConfig {
 
     /// Encoded packet number lengths, in bytes, of the first packets sent
     ///
-    /// Entry `i` applies to the packet numbered [`TransportConfig::initial_packet_number`]` + i`
-    /// in each space; later packets use the shortest encoding. An entry shorter than the
-    /// shortest valid encoding is ignored, and entries are clamped to 1..=4. Empty by default.
+    /// Entry `i` is the minimum length of the packet numbered
+    /// [`TransportConfig::initial_packet_number`]` + i` in each space, and the last entry that of
+    /// every later packet. A packet number whose shortest valid encoding is longer uses that
+    /// instead. Entries are clamped to 1..=4. Empty (the shortest encoding) by default.
     pub fn packet_number_lengths(&mut self, value: Vec<u8>) -> &mut Self {
         self.packet_number_lengths = value.into_iter().map(|len| len.clamp(1, 4)).collect();
         self
+    }
+
+    /// The configured minimum encoded length of packet number `number`
+    pub(crate) fn packet_number_length(&self, number: u64) -> Option<usize> {
+        let index = number.checked_sub(self.initial_packet_number)?;
+        let last = self.packet_number_lengths.len().checked_sub(1)?;
+        let index = usize::try_from(index).map_or(last, |index| index.min(last));
+        Some(usize::from(self.packet_number_lengths[index]))
     }
 
     /// Exact size of client datagrams carrying Initial packets

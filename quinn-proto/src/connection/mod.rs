@@ -3272,11 +3272,8 @@ impl Connection {
         let pn_len = |i: usize| {
             let n = pn + i as u64;
             let mut number = PacketNumber::new(n, largest_acked);
-            if let Some(&len) = n
-                .checked_sub(self.config.initial_packet_number)
-                .and_then(|i| self.config.packet_number_lengths.get(i as usize))
-            {
-                number = number.at_least(n, usize::from(len));
+            if let Some(len) = self.config.packet_number_length(n) {
+                number = number.at_least(n, len);
             }
             number.len()
         };
