@@ -49,6 +49,7 @@ pub struct TransportConfig {
     pub(crate) unspun_spin_bit: Option<bool>,
     pub(crate) send_ecn: bool,
     pub(crate) ecn_test_datagrams: Option<u32>,
+    pub(crate) fill_stream_frames: bool,
     pub(crate) keep_alive_with_open_streams_only: bool,
     pub(crate) datagram_receive_buffer_size: Option<usize>,
     pub(crate) datagram_send_buffer_size: usize,
@@ -340,6 +341,17 @@ impl TransportConfig {
         self
     }
 
+    /// Fill packets with STREAM data to the last byte
+    ///
+    /// When `true`, a STREAM frame is written whenever its type, stream ID, offset and one byte
+    /// of data fit, and its offset and length fields reserve only the bytes they take, so a
+    /// packet with more stream data pending is full. When `false` (the default), stream frames
+    /// stop once fewer than 25 bytes remain and a length reserves 8 bytes.
+    pub fn fill_stream_frames(&mut self, value: bool) -> &mut Self {
+        self.fill_stream_frames = value;
+        self
+    }
+
     /// Maximum number of incoming application datagram bytes to buffer, or None to disable
     /// incoming datagrams
     ///
@@ -542,6 +554,7 @@ impl Default for TransportConfig {
             unspun_spin_bit: None,
             send_ecn: true,
             ecn_test_datagrams: None,
+            fill_stream_frames: false,
             keep_alive_with_open_streams_only: false,
             datagram_receive_buffer_size: Some(STREAM_RWND as usize),
             datagram_send_buffer_size: 1024 * 1024,
@@ -591,6 +604,7 @@ impl fmt::Debug for TransportConfig {
             unspun_spin_bit,
             send_ecn,
             ecn_test_datagrams,
+            fill_stream_frames,
             keep_alive_with_open_streams_only,
             datagram_receive_buffer_size,
             datagram_send_buffer_size,
@@ -635,6 +649,7 @@ impl fmt::Debug for TransportConfig {
             .field("unspun_spin_bit", unspun_spin_bit)
             .field("send_ecn", send_ecn)
             .field("ecn_test_datagrams", ecn_test_datagrams)
+            .field("fill_stream_frames", fill_stream_frames)
             .field(
                 "keep_alive_with_open_streams_only",
                 keep_alive_with_open_streams_only,

@@ -134,6 +134,49 @@ impl SendBuffer {
         (result, encode_length)
     }
 
+    /// [`Self::poll_transmit`] for a frame that may take the packet's last bytes
+    ///
+    /// The offset and length fields reserve only the bytes they take, so `max_len` may be as
+    /// small as the frame needs. Returns `None`, leaving the state unchanged, when not even one
+    /// byte of data, or the bare FIN, fits.
+    pub(super) fn poll_transmit_fill(&mut self, max_len: usize) -> Option<(Range<u64>, bool)> {
+        let retransmit = self.retransmits.pop_min();
+        let (start, end) = match &retransmit {
+            Some(range) => (range.start, range.end),
+            None => (self.unsent, self.offset),
+        };
+        let offset_size = match start {
+            0 => 0,
+            start => VarInt::size(VarInt::from_u64(start).expect("offset fits a varint")),
+        };
+        let len = end - start;
+        let max_len = match max_len.checked_sub(offset_size) {
+            Some(max_len) if max_len > 0 || len == 0 => max_len,
+            _ => {
+                if let Some(range) = retransmit {
+                    self.retransmits.insert(range);
+                }
+                return None;
+            }
+        };
+        // Data that ends before the packet does needs a length; its size follows from the
+        // data, which is at most `len` (a varint never takes more bytes than it counts, plus 1)
+        let encode_length = len < max_len as u64;
+        let max_len = match encode_length {
+            true => max_len - VarInt::size(VarInt::from_u64(len).expect("length fits a varint")),
+            false => max_len,
+        };
+        let sent_end = end.min(start + max_len as u64);
+        match retransmit {
+            Some(range) if sent_end != range.end => {
+                self.retransmits.insert(sent_end..range.end);
+            }
+            Some(_) => {}
+            None => self.unsent = sent_end,
+        }
+        Some((start..sent_end, encode_length))
+    }
+
     /// Returns data which is associated with a range
     ///
     /// This function can return a subset of the range, if the data is stored
@@ -240,6 +283,24 @@ mod tests {
             buf.poll_transmit(58),
             (MSG.len() as u64..MSG.len() as u64, true)
         );
+    }
+
+    #[test]
+    fn fill_takes_the_last_bytes() {
+        let mut buf = SendBuffer::new();
+        const MSG: &[u8] = b"Hello, world!";
+        buf.write(MSG.into());
+        // Offset 0, 13 bytes and a 1-byte length fit in 14 bytes
+        assert_eq!(buf.poll_transmit_fill(14), Some((0..13, true)));
+        buf.retransmit(0..13);
+        // 5 bytes: without a length, the data runs to the end of the packet
+        assert_eq!(buf.poll_transmit_fill(5), Some((0..5, false)));
+        // Offset 5 takes 1 byte: nothing fits in 1, so nothing is taken
+        assert_eq!(buf.poll_transmit_fill(1), None);
+        assert_eq!(buf.poll_transmit_fill(4), Some((5..8, false)));
+        assert_eq!(buf.poll_transmit_fill(20), Some((8..13, true)));
+        // A bare FIN fits after the offset
+        assert_eq!(buf.poll_transmit_fill(1), Some((13..13, false)));
     }
 
     #[test]
