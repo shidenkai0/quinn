@@ -134,6 +134,44 @@ impl SendStream {
         Ok(())
     }
 
+    /// Write a slice of [`Bytes`] into this stream in its entirety, then finish it
+    ///
+    /// Like [`write_all_chunks`](Self::write_all_chunks) followed by [`finish`](Self::finish),
+    /// except that the last bytes are written and the stream finished under one lock, so the
+    /// connection cannot send them before the FIN is set: when everything fits in one packet, the
+    /// peer receives the data and the FIN in a single STREAM frame.
+    ///
+    /// # Cancel safety
+    ///
+    /// This method is *not* cancellation safe. Even if this does not resolve, some bytes may have
+    /// been written when previously polled.
+    pub async fn write_all_chunks_and_finish(
+        &mut self,
+        mut bufs: &mut [Bytes],
+    ) -> Result<(), WriteError> {
+        loop {
+            let (written, finished) = poll_fn(|cx| {
+                self.execute_poll(cx, |stream| {
+                    let written = stream.write_chunks(bufs)?;
+                    if written.chunks < bufs.len() {
+                        return Ok((written, false));
+                    }
+                    match stream.finish() {
+                        Ok(()) | Err(proto::FinishError::Stopped(_)) => Ok((written, true)),
+                        Err(proto::FinishError::ClosedStream) => {
+                            Err(proto::WriteError::ClosedStream)
+                        }
+                    }
+                })
+            })
+            .await?;
+            if finished {
+                return Ok(());
+            }
+            bufs = &mut bufs[written.chunks..];
+        }
+    }
+
     fn execute_poll<F, R>(&mut self, cx: &mut Context, write_fn: F) -> Poll<Result<R, WriteError>>
     where
         F: FnOnce(&mut proto::SendStream) -> Result<R, proto::WriteError>,

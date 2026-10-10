@@ -953,6 +953,42 @@ async fn multiple_conns_with_zero_length_cids() {
     tokio::join!(client1, client2, server);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_all_chunks_and_finish_sends_data_with_fin() {
+    let _guard = subscribe();
+    const STREAMS: u64 = 50;
+    let factory = EndpointFactory::new();
+    let server = factory.endpoint();
+    let server_addr = server.local_addr().unwrap();
+    let client = factory.endpoint();
+    let server = tokio::spawn(async move {
+        let conn = server.accept().await.unwrap().await.unwrap();
+        for _ in 0..STREAMS {
+            let (_send, mut recv) = conn.accept_bi().await.unwrap();
+            assert_eq!(recv.read_to_end(64).await.unwrap(), b"headers");
+        }
+        conn.stats().frame_rx.stream
+    });
+    let conn = client
+        .connect(server_addr, "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    for _ in 0..STREAMS {
+        let (mut send, _recv) = conn.open_bi().await.unwrap();
+        let mut chunks = [Bytes::from_static(b"head"), Bytes::from_static(b"ers")];
+        send.write_all_chunks_and_finish(&mut chunks).await.unwrap();
+        // Keep the stream until the server has read it, as a request awaiting its response
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    // One STREAM frame per stream: its data and the FIN together
+    let frames = timeout(Duration::from_secs(5), server)
+        .await
+        .expect("timeout")
+        .unwrap();
+    assert_eq!(frames, STREAMS);
+}
+
 #[tokio::test]
 async fn stream_stopped() {
     let _guard = subscribe();
