@@ -59,7 +59,9 @@ pub struct TransportConfig {
     pub(crate) shared_packet_numbers: bool,
     pub(crate) packet_number_lengths: Vec<u8>,
     pub(crate) initial_datagram_size: Option<u16>,
+    pub(crate) initial_datagram_trailing_padding: bool,
     pub(crate) initial_layout: Option<Arc<dyn InitialLayout>>,
+    pub(crate) active_connection_id_limit: u32,
 
     pub(crate) qlog_sink: QlogSink,
 }
@@ -359,9 +361,11 @@ impl TransportConfig {
         self
     }
 
-    /// The number of the first packet sent in each packet number space
+    /// The number of the first packet sent in the Initial packet number space
     ///
-    /// Defaults to 0. Must be less than 2^30.
+    /// The Handshake and application data spaces start at 0, unless
+    /// [`TransportConfig::shared_packet_numbers`] continues them from the Initial space. Defaults
+    /// to 0. Must be less than 2^30.
     pub fn initial_packet_number(&mut self, value: u64) -> &mut Self {
         self.initial_packet_number = value.min((1 << 30) - 1);
         self
@@ -381,7 +385,7 @@ impl TransportConfig {
     /// Encoded packet number lengths, in bytes, of the first packets sent
     ///
     /// Entry `i` is the minimum length of the packet numbered
-    /// [`TransportConfig::initial_packet_number`]` + i` in each space, and the last entry that of
+    /// [`TransportConfig::initial_packet_number`]` + i` in any space, and the last entry that of
     /// every later packet. A packet number whose shortest valid encoding is longer uses that
     /// instead. Entries are clamped to 1..=4. Empty (the shortest encoding) by default.
     pub fn packet_number_lengths(&mut self, value: Vec<u8>) -> &mut Self {
@@ -405,6 +409,28 @@ impl TransportConfig {
     /// `None` (the default) pads Initial datagrams to at least `min_mtu`.
     pub fn initial_datagram_size(&mut self, value: Option<u16>) -> &mut Self {
         self.initial_datagram_size = value.map(|size| size.clamp(INITIAL_MTU, MAX_UDP_PAYLOAD));
+        self
+    }
+
+    /// Whether Initial datagrams are padded after their packets rather than inside them
+    ///
+    /// When enabled together with [`TransportConfig::initial_datagram_size`], a client fills a
+    /// datagram carrying an Initial packet up to that size with zero bytes after its last
+    /// packet instead of PADDING frames in it (RFC 9000 §14.1 allows both). A datagram ending
+    /// with a short-header packet, which extends to the end of the datagram, is still padded
+    /// with PADDING frames. Defaults to `false`.
+    pub fn initial_datagram_trailing_padding(&mut self, value: bool) -> &mut Self {
+        self.initial_datagram_trailing_padding = value;
+        self
+    }
+
+    /// Maximum number of connection IDs the peer may issue to this endpoint at once
+    ///
+    /// Advertised as the `active_connection_id_limit` transport parameter when this endpoint uses
+    /// non-empty connection IDs, and the size of the window of the peer's connection IDs kept for
+    /// use. Defaults to 5; clamped to 2..=64.
+    pub fn active_connection_id_limit(&mut self, value: u32) -> &mut Self {
+        self.active_connection_id_limit = value.clamp(2, 64);
         self
     }
 
@@ -468,7 +494,9 @@ impl Default for TransportConfig {
             shared_packet_numbers: false,
             packet_number_lengths: Vec::new(),
             initial_datagram_size: None,
+            initial_datagram_trailing_padding: false,
             initial_layout: None,
+            active_connection_id_limit: 5,
 
             qlog_sink: QlogSink::default(),
         }
@@ -507,7 +535,9 @@ impl fmt::Debug for TransportConfig {
             shared_packet_numbers,
             packet_number_lengths,
             initial_datagram_size,
+            initial_datagram_trailing_padding,
             initial_layout,
+            active_connection_id_limit,
             qlog_sink,
         } = self;
         let mut s = fmt.debug_struct("TransportConfig");
@@ -542,7 +572,12 @@ impl fmt::Debug for TransportConfig {
             .field("shared_packet_numbers", shared_packet_numbers)
             .field("packet_number_lengths", packet_number_lengths)
             .field("initial_datagram_size", initial_datagram_size)
-            .field("initial_layout", initial_layout);
+            .field(
+                "initial_datagram_trailing_padding",
+                initial_datagram_trailing_padding,
+            )
+            .field("initial_layout", initial_layout)
+            .field("active_connection_id_limit", active_connection_id_limit);
         if cfg!(feature = "qlog") {
             s.field("qlog_stream", &qlog_sink.is_enabled());
         }

@@ -152,10 +152,10 @@ fn first_packet_number_and_lengths() {
     pair.drive();
     let server_ch = pair.server.assert_accept();
     pair.finish_connect(client_ch, server_ch);
-    // Every space starts at 1
+    // Only the Initial space starts at 1
     pair.drive();
     let [initial, handshake, data] = pair.client_conn_mut(client_ch).next_packet_numbers();
-    assert!(initial > 2 && handshake > 1 && data > 1);
+    assert!(initial > 2 && handshake > 0 && data > 0);
 }
 
 #[test]
@@ -226,9 +226,10 @@ struct SwapHalves;
 impl InitialLayout for SwapHalves {
     fn plan(
         &self,
-        crypto_len: u64,
+        crypto: &[u8],
         frame_space: &dyn Fn(usize) -> usize,
     ) -> Option<Vec<Vec<InitialFrame>>> {
+        let crypto_len = crypto.len() as u64;
         let half = crypto_len / 2;
         let fill = |i: usize, frames: &[InitialFrame]| {
             let used = frames.iter().map(InitialFrame::encoded_len).sum::<usize>();
@@ -262,10 +263,10 @@ impl InitialLayout for SwapHalves {
 struct Invalid;
 
 impl InitialLayout for Invalid {
-    fn plan(&self, crypto_len: u64, _: &dyn Fn(usize) -> usize) -> Option<Vec<Vec<InitialFrame>>> {
+    fn plan(&self, crypto: &[u8], _: &dyn Fn(usize) -> usize) -> Option<Vec<Vec<InitialFrame>>> {
         Some(vec![vec![InitialFrame::Crypto {
             offset: 0,
-            len: crypto_len - 1,
+            len: crypto.len() as u64 - 1,
         }]])
     }
 }
@@ -383,4 +384,100 @@ fn invalid_initial_layout_is_ignored() {
     pair.drive();
     let server_ch = pair.server.assert_accept();
     pair.finish_connect(client_ch, server_ch);
+}
+
+/// Sends a ClientHello split in two, the second half first, without padding: each packet in
+/// its own datagram
+#[derive(Debug)]
+struct TwoHalves;
+
+impl InitialLayout for TwoHalves {
+    fn plan(&self, crypto: &[u8], _: &dyn Fn(usize) -> usize) -> Option<Vec<Vec<InitialFrame>>> {
+        let len = crypto.len() as u64;
+        let half = len / 2;
+        Some(vec![
+            vec![InitialFrame::Crypto {
+                offset: half,
+                len: len - half,
+            }],
+            vec![InitialFrame::Crypto {
+                offset: 0,
+                len: half,
+            }],
+        ])
+    }
+}
+
+#[test]
+fn trailing_padding_and_planned_datagrams() {
+    let _guard = subscribe();
+    let mut transport = TransportConfig::default();
+    transport
+        .initial_packet_number(300)
+        .initial_datagram_size(Some(1252))
+        .initial_datagram_trailing_padding(true)
+        .initial_layout(Some(Arc::new(TwoHalves)));
+    let mut pair = Pair::default();
+    let client_ch = pair.begin_connect(client_config_with(transport));
+    pair.client.drive(pair.time, pair.server.addr);
+    let first_flight = pair
+        .client
+        .outbound
+        .iter()
+        .map(|(_, data)| data.clone())
+        .collect::<Vec<_>>();
+    // Short planned packets still get a datagram each, padded with zeros after the packet
+    assert_eq!(first_flight.len(), 2);
+    for (i, datagram) in first_flight.iter().enumerate() {
+        assert_eq!(datagram.len(), 1252);
+        let packets = client_initials(datagram);
+        assert_eq!(packets.len(), 1);
+        assert_eq!(packets[0].number, 300 + i as u64);
+        assert!(
+            !packets[0]
+                .frames
+                .iter()
+                .any(|f| matches!(f, Decoded::Padding(_))),
+            "{:?}",
+            packets[0].frames
+        );
+        assert_eq!(*datagram.last().unwrap(), 0);
+    }
+
+    let mut datagrams = Vec::new();
+    for _ in 0..100 {
+        pair.client.drive(pair.time, pair.server.addr);
+        datagrams.extend(pair.client.outbound.iter().map(|(_, data)| data.clone()));
+        if !pair.step() {
+            break;
+        }
+    }
+    for datagram in datagrams.iter().filter(|d| is_initial(d)) {
+        assert_eq!(datagram.len(), 1252);
+    }
+    let server_ch = pair.server.assert_accept();
+    pair.finish_connect(client_ch, server_ch);
+    // The other spaces start at 0
+    let [_, handshake, data] = pair.client_conn_mut(client_ch).next_packet_numbers();
+    assert!(handshake < 300 && data < 300);
+}
+
+#[test]
+fn active_connection_id_limit() {
+    let _guard = subscribe();
+    let mut transport = TransportConfig::default();
+    transport.active_connection_id_limit(8);
+    let mut server_config = server_config();
+    let mut server_transport = TransportConfig::default();
+    server_transport.active_connection_id_limit(8);
+    server_config.transport_config(Arc::new(server_transport));
+    let mut pair = Pair::new(Default::default(), server_config);
+    let (client_ch, server_ch) = pair.connect_with(client_config_with(transport));
+    pair.drive();
+    // The peer may issue up to 8 connection IDs without a CONNECTION_ID_LIMIT_ERROR
+    assert_eq!(pair.server_conn_mut(server_ch).connection_id_limits().0, 8);
+    let (_, window, held) = pair.client_conn_mut(client_ch).connection_id_limits();
+    assert_eq!(window, 8);
+    assert!(held > 5, "{held}");
+    assert!(!pair.client_conn_mut(client_ch).is_closed());
 }

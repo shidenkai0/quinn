@@ -58,15 +58,16 @@ impl InitialFrame {
 /// Only the first transmission of the first flight is affected; retransmissions, ACKs and later
 /// Initial packets use the default layout.
 pub trait InitialLayout: Send + Sync + fmt::Debug {
-    /// Plan the packets carrying the first `crypto_len` bytes of the CRYPTO stream
+    /// Plan the packets carrying `crypto`, the start of the CRYPTO stream (the ClientHello)
     ///
     /// `frame_space(i)` is the exact number of bytes available for frames in the `i`th packet of
-    /// the flight; space a packet leaves unused is filled with trailing PADDING. Returns the frames
-    /// of each packet in wire order, or `None` for the default layout. The CRYPTO frames of a
-    /// valid plan cover `0..crypto_len` exactly once; an invalid plan is ignored.
+    /// the flight; space a packet leaves unused is padded. Every planned packet but the last ends
+    /// its datagram. Returns the frames of each packet in wire order, or `None` for the default
+    /// layout. The CRYPTO frames of a valid plan cover `0..crypto.len()` exactly once; an invalid
+    /// plan is ignored.
     fn plan(
         &self,
-        crypto_len: u64,
+        crypto: &[u8],
         frame_space: &dyn Fn(usize) -> usize,
     ) -> Option<Vec<Vec<InitialFrame>>>;
 }

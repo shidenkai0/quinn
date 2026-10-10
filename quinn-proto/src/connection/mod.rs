@@ -270,14 +270,11 @@ impl Connection {
         let path_validated = side_args.path_validated();
         let connection_side = ConnectionSide::from(side_args);
         let side = connection_side.side();
-        let first_packet_number = config.initial_packet_number;
-        let new_space = || PacketSpace {
-            next_packet_number: first_packet_number,
-            ..PacketSpace::new(now)
-        };
+        let rem_cid_window = config.active_connection_id_limit as usize;
         let initial_space = PacketSpace {
             crypto: Some(crypto.initial_keys(&init_cid, side)),
-            ..new_space()
+            next_packet_number: config.initial_packet_number,
+            ..PacketSpace::new(now)
         };
         let state = State::Handshake(state::Handshake {
             rem_cid_set: side.is_server(),
@@ -321,7 +318,7 @@ impl Connection {
             endpoint_events: VecDeque::new(),
             spin_enabled: config.allow_spin && rng.random_ratio(7, 8),
             spin: false,
-            spaces: [initial_space, new_space(), new_space()],
+            spaces: [initial_space, PacketSpace::new(now), PacketSpace::new(now)],
             highest_space: SpaceId::Initial,
             prev_crypto: None,
             next_crypto: None,
@@ -366,7 +363,7 @@ impl Connection {
             ),
             datagrams: DatagramState::default(),
             config,
-            rem_cids: CidQueue::new(rem_cid),
+            rem_cids: CidQueue::with_len(rem_cid, rem_cid_window),
             rng,
             stats: ConnectionStats::default(),
             version,
@@ -494,6 +491,9 @@ impl Connection {
             segment_size = usize::from(size);
         }
         let initial_pad = initial_datagram_size.unwrap_or(min_mtu);
+        // Padding Initial datagrams with zero bytes after their packets needs an exact size.
+        let trailing_padding =
+            initial_datagram_size.is_some() && self.config.initial_datagram_trailing_padding;
 
         if let Some(challenge) = self.send_path_challenge(now, buf) {
             return Some(challenge);
@@ -660,11 +660,17 @@ impl Connection {
 
                 // Finish current packet
                 if let Some(mut builder) = builder_storage.take() {
-                    if pad_datagram {
+                    // A short-header packet extends to the end of its datagram, so nothing may
+                    // follow it.
+                    let pad_after = pad_datagram && trailing_padding && !builder.short_header;
+                    if pad_datagram && !pad_after {
                         builder.pad_to(initial_pad);
                     }
 
-                    if num_datagrams > 1 || pad_datagram_to_mtu {
+                    if pad_after {
+                        // Padded to the segment size after the packet, which keeps the GSO
+                        // batch aligned.
+                    } else if num_datagrams > 1 || pad_datagram_to_mtu {
                         // If too many padding bytes would be required to continue the GSO batch
                         // after this packet, end the GSO batch here. Ensures that fixed-size frames
                         // with heterogeneous sizes (e.g. application datagrams) won't inadvertently
@@ -699,6 +705,9 @@ impl Connection {
                     }
 
                     builder.finish_and_track(now, self, sent_frames.take(), buf);
+                    if pad_after {
+                        buf.resize(buf.len().max(datagram_start + segment_size), 0);
+                    }
 
                     if num_datagrams == 1 {
                         // Set the segment size for this GSO batch to the size of the first UDP
@@ -906,6 +915,10 @@ impl Connection {
 
             let sent =
                 self.populate_packet(now, space_id, buf, builder.max_size, builder.exact_number);
+            // The rest of a planned first flight starts a new datagram, whatever space is left.
+            if matches!(self.initial_plan, InitialPlan::Active { .. }) {
+                coalesce = false;
+            }
 
             // ACK-only packets should only be sent when explicitly allowed. If we write them due to
             // any other reason, there is a bug which leads to one component announcing write
@@ -938,7 +951,8 @@ impl Connection {
 
         // Finish the last packet
         if let Some(mut builder) = builder_storage {
-            if pad_datagram {
+            let pad_after = pad_datagram && trailing_padding && !builder.short_header;
+            if pad_datagram && !pad_after {
                 builder.pad_to(initial_pad);
             }
 
@@ -953,6 +967,9 @@ impl Connection {
 
             let last_packet_number = builder.exact_number;
             builder.finish_and_track(now, self, sent_frames, buf);
+            if pad_after {
+                buf.resize(buf.len().max(datagram_start + usize::from(initial_pad)), 0);
+            }
             self.path
                 .congestion
                 .on_sent(now, buf.len() as u64, last_packet_number);
@@ -3172,6 +3189,17 @@ impl Connection {
             .push_back(EndpointEventInner::NeedIdentifiers(now, n));
     }
 
+    /// The peer's `active_connection_id_limit`, and the length and occupancy of the window of
+    /// the peer's connection IDs
+    #[cfg(test)]
+    pub(crate) fn connection_id_limits(&self) -> (u64, usize, usize) {
+        (
+            self.peer_params.active_connection_id_limit.0,
+            self.rem_cids.len(),
+            self.rem_cids.count(),
+        )
+    }
+
     /// Next packet number of the Initial, Handshake and application data spaces
     #[cfg(test)]
     pub(crate) fn next_packet_numbers(&self) -> [u64; 3] {
@@ -3280,7 +3308,7 @@ impl Connection {
         let first_len = pn_len(0);
         let space_of = |i: usize| (frame_space + first_len).saturating_sub(pn_len(i));
         let crypto_len = first_flight.len() as u64;
-        match layout.plan(crypto_len, &space_of) {
+        match layout.plan(&first_flight, &space_of) {
             Some(packets) if crate::initial_layout::validate(&packets, crypto_len, &space_of) => {
                 InitialPlan::Active {
                     data: first_flight,
