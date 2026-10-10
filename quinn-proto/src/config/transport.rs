@@ -8,8 +8,8 @@ use qlog::streamer::QlogStreamer;
 #[cfg(feature = "qlog")]
 use crate::QlogStream;
 use crate::{
-    Duration, INITIAL_MTU, MAX_UDP_PAYLOAD, VarInt, VarIntBoundsExceeded, congestion,
-    connection::qlog::QlogSink,
+    Duration, INITIAL_MTU, InitialLayout, MAX_UDP_PAYLOAD, VarInt, VarIntBoundsExceeded,
+    congestion, connection::qlog::QlogSink,
 };
 
 /// Parameters governing the core QUIC state machine
@@ -54,6 +54,12 @@ pub struct TransportConfig {
     pub(crate) congestion_controller_factory: Arc<dyn congestion::ControllerFactory + Send + Sync>,
 
     pub(crate) enable_segmentation_offload: bool,
+
+    pub(crate) initial_packet_number: u64,
+    pub(crate) shared_packet_numbers: bool,
+    pub(crate) packet_number_lengths: Vec<u8>,
+    pub(crate) initial_datagram_size: Option<u16>,
+    pub(crate) initial_layout: Option<Arc<dyn InitialLayout>>,
 
     pub(crate) qlog_sink: QlogSink,
 }
@@ -353,6 +359,54 @@ impl TransportConfig {
         self
     }
 
+    /// The number of the first packet sent in each packet number space
+    ///
+    /// Defaults to 0. Must be less than 2^30.
+    pub fn initial_packet_number(&mut self, value: u64) -> &mut Self {
+        self.initial_packet_number = value.min((1 << 30) - 1);
+        self
+    }
+
+    /// Whether outgoing packet numbers increase across packet number spaces
+    ///
+    /// When enabled, every packet sent takes a number greater than that of any packet sent before
+    /// it in any space, as if the Initial, Handshake and application data spaces shared one
+    /// counter. Packet numbers in each space still increase, as RFC 9000 requires. Defaults to
+    /// `false`.
+    pub fn shared_packet_numbers(&mut self, value: bool) -> &mut Self {
+        self.shared_packet_numbers = value;
+        self
+    }
+
+    /// Encoded packet number lengths, in bytes, of the first packets sent
+    ///
+    /// Entry `i` applies to the packet numbered [`TransportConfig::initial_packet_number`]` + i`
+    /// in each space; later packets use the shortest encoding. An entry shorter than the
+    /// shortest valid encoding is ignored, and entries are clamped to 1..=4. Empty by default.
+    pub fn packet_number_lengths(&mut self, value: Vec<u8>) -> &mut Self {
+        self.packet_number_lengths = value.into_iter().map(|len| len.clamp(1, 4)).collect();
+        self
+    }
+
+    /// Exact size of client datagrams carrying Initial packets
+    ///
+    /// When set, a client pads every datagram that carries an Initial packet to exactly this many
+    /// bytes, and builds no larger datagrams while it still has Initial keys, regardless of
+    /// [`TransportConfig::min_mtu`] and [`TransportConfig::initial_mtu`]. Must be at least 1200.
+    /// `None` (the default) pads Initial datagrams to at least `min_mtu`.
+    pub fn initial_datagram_size(&mut self, value: Option<u16>) -> &mut Self {
+        self.initial_datagram_size = value.map(|size| size.clamp(INITIAL_MTU, MAX_UDP_PAYLOAD));
+        self
+    }
+
+    /// Frame layout of a client's first flight of Initial packets
+    ///
+    /// `None` (the default) sends the ClientHello as in-order CRYPTO frames followed by PADDING.
+    pub fn initial_layout(&mut self, value: Option<Arc<dyn InitialLayout>>) -> &mut Self {
+        self.initial_layout = value;
+        self
+    }
+
     /// qlog capture configuration to use for a particular connection
     #[cfg(feature = "qlog")]
     pub fn qlog_stream(&mut self, stream: Option<QlogStream>) -> &mut Self {
@@ -401,6 +455,12 @@ impl Default for TransportConfig {
 
             enable_segmentation_offload: true,
 
+            initial_packet_number: 0,
+            shared_packet_numbers: false,
+            packet_number_lengths: Vec::new(),
+            initial_datagram_size: None,
+            initial_layout: None,
+
             qlog_sink: QlogSink::default(),
         }
     }
@@ -434,6 +494,11 @@ impl fmt::Debug for TransportConfig {
                 deterministic_packet_numbers: _,
             congestion_controller_factory: _,
             enable_segmentation_offload,
+            initial_packet_number,
+            shared_packet_numbers,
+            packet_number_lengths,
+            initial_datagram_size,
+            initial_layout,
             qlog_sink,
         } = self;
         let mut s = fmt.debug_struct("TransportConfig");
@@ -463,7 +528,12 @@ impl fmt::Debug for TransportConfig {
             .field("datagram_receive_buffer_size", datagram_receive_buffer_size)
             .field("datagram_send_buffer_size", datagram_send_buffer_size)
             // congestion_controller_factory not debug
-            .field("enable_segmentation_offload", enable_segmentation_offload);
+            .field("enable_segmentation_offload", enable_segmentation_offload)
+            .field("initial_packet_number", initial_packet_number)
+            .field("shared_packet_numbers", shared_packet_numbers)
+            .field("packet_number_lengths", packet_number_lengths)
+            .field("initial_datagram_size", initial_datagram_size)
+            .field("initial_layout", initial_layout);
         if cfg!(feature = "qlog") {
             s.field("qlog_stream", &qlog_sink.is_enabled());
         }

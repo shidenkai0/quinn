@@ -67,7 +67,10 @@ pub mod crypto;
 
 mod frame;
 use crate::frame::Frame;
+
+mod initial_layout;
 pub use crate::frame::{ApplicationClose, ConnectionClose, Datagram, FrameType};
+pub use crate::initial_layout::{InitialFrame, InitialLayout};
 
 mod endpoint;
 pub use crate::endpoint::{

@@ -702,6 +702,16 @@ impl PacketNumber {
         }
     }
 
+    /// Re-encode `n`, this packet number's full value, in at least `len` bytes
+    pub(crate) fn at_least(self, n: u64, len: usize) -> Self {
+        match len.max(self.len()) {
+            1 => Self::U8(n as u8),
+            2 => Self::U16(n as u16),
+            3 => Self::U24(n as u32 & 0xff_ffff),
+            _ => Self::U32(n as u32),
+        }
+    }
+
     pub(crate) fn len(self) -> usize {
         use PacketNumber::*;
         match self {

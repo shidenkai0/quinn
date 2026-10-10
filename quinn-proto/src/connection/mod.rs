@@ -15,7 +15,7 @@ use thiserror::Error;
 use tracing::{debug, error, trace, trace_span, warn};
 
 use crate::{
-    Dir, Duration, EndpointConfig, Frame, Instant, MAX_CID_SIZE, MAX_STREAM_COUNT,
+    Dir, Duration, EndpointConfig, Frame, InitialFrame, Instant, MAX_CID_SIZE, MAX_STREAM_COUNT,
     MIN_INITIAL_SIZE, Side, StreamId, TIMER_GRANULARITY, TokenStore, Transmit, TransportError,
     TransportErrorCode, VarInt,
     cid_generator::ConnectionIdGenerator,
@@ -245,6 +245,8 @@ pub struct Connection {
     stats: ConnectionStats,
     /// QUIC version used for the connection.
     version: u32,
+    /// Layout of the client's first flight of Initial packets
+    initial_plan: InitialPlan,
 }
 
 impl Connection {
@@ -268,9 +270,14 @@ impl Connection {
         let path_validated = side_args.path_validated();
         let connection_side = ConnectionSide::from(side_args);
         let side = connection_side.side();
+        let first_packet_number = config.initial_packet_number;
+        let new_space = || PacketSpace {
+            next_packet_number: first_packet_number,
+            ..PacketSpace::new(now)
+        };
         let initial_space = PacketSpace {
             crypto: Some(crypto.initial_keys(&init_cid, side)),
-            ..PacketSpace::new(now)
+            ..new_space()
         };
         let state = State::Handshake(state::Handshake {
             rem_cid_set: side.is_server(),
@@ -314,7 +321,7 @@ impl Connection {
             endpoint_events: VecDeque::new(),
             spin_enabled: config.allow_spin && rng.random_ratio(7, 8),
             spin: false,
-            spaces: [initial_space, PacketSpace::new(now), PacketSpace::new(now)],
+            spaces: [initial_space, new_space(), new_space()],
             highest_space: SpaceId::Initial,
             prev_crypto: None,
             next_crypto: None,
@@ -363,6 +370,7 @@ impl Connection {
             rng,
             stats: ConnectionStats::default(),
             version,
+            initial_plan: InitialPlan::Unplanned,
         };
         if path_validated {
             this.on_path_validated();
@@ -476,6 +484,16 @@ impl Connection {
         let mut segment_size = usize::from(self.path.current_mtu());
         // The peer's maximum UDP payload size can reduce the path MTU below our configured minimum.
         let min_mtu = Ord::min(self.config.min_mtu, self.path.current_mtu());
+        // A client with an exact Initial datagram size builds datagrams of that size until it
+        // discards its Initial keys, and pads Initial datagrams to it.
+        let initial_datagram_size = self
+            .config
+            .initial_datagram_size
+            .filter(|_| self.side.is_client() && self.spaces[SpaceId::Initial].crypto.is_some());
+        if let Some(size) = initial_datagram_size {
+            segment_size = usize::from(size);
+        }
+        let initial_pad = initial_datagram_size.unwrap_or(min_mtu);
 
         if let Some(challenge) = self.send_path_challenge(now, buf) {
             return Some(challenge);
@@ -643,7 +661,7 @@ impl Connection {
                 // Finish current packet
                 if let Some(mut builder) = builder_storage.take() {
                     if pad_datagram {
-                        builder.pad_to(min_mtu);
+                        builder.pad_to(initial_pad);
                     }
 
                     if num_datagrams > 1 || pad_datagram_to_mtu {
@@ -717,8 +735,11 @@ impl Connection {
                         self.spaces[space_id].loss_probes -= 1;
                         // Clamp the datagram to at most the minimum MTU to ensure that loss probes
                         // can get through and enable recovery even if the path MTU has shrank
-                        // unexpectedly.
-                        std::cmp::min(segment_size, usize::from(min_mtu))
+                        // unexpectedly. Initial datagrams of an exact size keep it.
+                        match initial_datagram_size {
+                            Some(_) => segment_size,
+                            None => std::cmp::min(segment_size, usize::from(min_mtu)),
+                        }
                     }
                 };
                 buf_capacity += next_datagram_size_limit;
@@ -918,7 +939,7 @@ impl Connection {
         // Finish the last packet
         if let Some(mut builder) = builder_storage {
             if pad_datagram {
-                builder.pad_to(min_mtu);
+                builder.pad_to(initial_pad);
             }
 
             // If this datagram is a loss probe and `segment_size` is larger than `min_mtu`,
@@ -2510,6 +2531,7 @@ impl Connection {
                 };
 
                 self.discard_space(now, SpaceId::Initial); // Make sure we clean up after any retransmitted Initials
+                self.initial_plan = InitialPlan::Unplanned;
                 self.spaces[SpaceId::Initial] = PacketSpace {
                     crypto: Some(self.crypto.initial_keys(&rem_cid, self.side.side())),
                     next_packet_number: self.spaces[SpaceId::Initial].next_packet_number,
@@ -3150,6 +3172,128 @@ impl Connection {
             .push_back(EndpointEventInner::NeedIdentifiers(now, n));
     }
 
+    /// Next packet number of the Initial, Handshake and application data spaces
+    #[cfg(test)]
+    pub(crate) fn next_packet_numbers(&self) -> [u64; 3] {
+        [SpaceId::Initial, SpaceId::Handshake, SpaceId::Data]
+            .map(|space| self.spaces[space].next_packet_number)
+    }
+
+    /// Write the next packet of a client's planned first flight, if there is one
+    ///
+    /// The plan is made when the first Initial packet is built. The first flight's CRYPTO frame
+    /// stays queued until the plan is complete, so the packets count as ack-eliciting.
+    fn populate_planned_initial(
+        &mut self,
+        buf: &mut Vec<u8>,
+        max_size: usize,
+        pn: u64,
+    ) -> Option<SentFrames> {
+        if matches!(self.initial_plan, InitialPlan::Unplanned) {
+            self.initial_plan = self.plan_initial(max_size.saturating_sub(buf.len()), pn);
+        }
+        let InitialPlan::Active { data, packets } = &mut self.initial_plan else {
+            return None;
+        };
+        let frames = packets.pop_front()?;
+        let size = frames.iter().map(InitialFrame::encoded_len).sum::<usize>();
+        if size > max_size.saturating_sub(buf.len()) {
+            // The header grew since planning: send what is left in order instead.
+            let mut remaining = frames
+                .into_iter()
+                .chain(packets.drain(..).flatten())
+                .filter_map(|frame| match frame {
+                    InitialFrame::Crypto { offset, len } => Some(frame::Crypto {
+                        offset,
+                        data: data.slice(offset as usize..(offset + len) as usize),
+                    }),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            remaining.sort_unstable_by_key(|frame| frame.offset);
+            let pending = &mut self.spaces[SpaceId::Initial].pending.crypto;
+            pending.pop_front();
+            for frame in remaining.into_iter().rev() {
+                pending.push_front(frame);
+            }
+            self.initial_plan = InitialPlan::Done;
+            return None;
+        }
+
+        let mut sent = SentFrames::default();
+        for frame in frames {
+            frame.encode_header(buf);
+            match frame {
+                InitialFrame::Crypto { offset, len } => {
+                    let data = data.slice(offset as usize..(offset + len) as usize);
+                    trace!("CRYPTO: off {} len {}", offset, len);
+                    buf.extend_from_slice(&data);
+                    self.stats.frame_tx.crypto += 1;
+                    sent.retransmits
+                        .get_or_create()
+                        .crypto
+                        .push_back(frame::Crypto { offset, data });
+                }
+                InitialFrame::Ping => {
+                    trace!("PING");
+                    self.stats.frame_tx.ping += 1;
+                    sent.non_retransmits = true;
+                }
+                InitialFrame::Padding(n) => trace!("PADDING * {}", n),
+            }
+        }
+        if packets.is_empty() {
+            // Every byte of the first flight is now tracked by a sent packet.
+            self.spaces[SpaceId::Initial].pending.crypto.pop_front();
+            self.initial_plan = InitialPlan::Done;
+        }
+        Some(sent)
+    }
+
+    /// Plan the client's first flight with the configured [`InitialLayout`], given the frame space
+    /// of the first packet, numbered `pn`
+    fn plan_initial(&self, frame_space: usize, pn: u64) -> InitialPlan {
+        let Some(layout) = &self.config.initial_layout else {
+            return InitialPlan::Done;
+        };
+        let space = &self.spaces[SpaceId::Initial];
+        let first_flight = match space.pending.crypto.front() {
+            Some(frame)
+                if space.pending.crypto.len() == 1
+                    && frame.offset == 0
+                    && frame.data.len() as u64 == space.crypto_offset
+                    && space.sent_packets.is_empty() =>
+            {
+                frame.data.clone()
+            }
+            _ => return InitialPlan::Done,
+        };
+        let largest_acked = space.largest_acked_packet.unwrap_or(0);
+        let pn_len = |i: usize| {
+            let n = pn + i as u64;
+            let mut number = PacketNumber::new(n, largest_acked);
+            if let Some(&len) = n
+                .checked_sub(self.config.initial_packet_number)
+                .and_then(|i| self.config.packet_number_lengths.get(i as usize))
+            {
+                number = number.at_least(n, usize::from(len));
+            }
+            number.len()
+        };
+        let first_len = pn_len(0);
+        let space_of = |i: usize| (frame_space + first_len).saturating_sub(pn_len(i));
+        let crypto_len = first_flight.len() as u64;
+        match layout.plan(crypto_len, &space_of) {
+            Some(packets) if crate::initial_layout::validate(&packets, crypto_len, &space_of) => {
+                InitialPlan::Active {
+                    data: first_flight,
+                    packets: packets.into(),
+                }
+            }
+            _ => InitialPlan::Done,
+        }
+    }
+
     fn populate_packet(
         &mut self,
         now: Instant,
@@ -3158,6 +3302,12 @@ impl Connection {
         max_size: usize,
         pn: u64,
     ) -> SentFrames {
+        if space_id == SpaceId::Initial && self.side.is_client() {
+            if let Some(sent) = self.populate_planned_initial(buf, max_size, pn) {
+                return sent;
+            }
+        }
+
         let mut sent = SentFrames::default();
         let space = &mut self.spaces[space_id];
         let is_0rtt = space_id == SpaceId::Data && space.crypto.is_none();
@@ -4073,6 +4223,19 @@ const MAX_HANDSHAKE_OR_0RTT_HEADER_SIZE: usize =
 ///
 /// Chosen arbitrarily, intended to be large enough to prevent spurious connection loss.
 const KEY_UPDATE_MARGIN: u64 = 10_000;
+
+/// Progress of a client's planned first flight (see [`crate::InitialLayout`])
+enum InitialPlan {
+    /// Not planned yet: planned when the first Initial packet is built
+    Unplanned,
+    /// Packets left to send, and the first flight's CRYPTO data
+    Active {
+        data: Bytes,
+        packets: VecDeque<Vec<InitialFrame>>,
+    },
+    /// Sent, abandoned, or no layout configured
+    Done,
+}
 
 #[derive(Default)]
 struct SentFrames {

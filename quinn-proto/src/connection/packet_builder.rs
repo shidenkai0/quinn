@@ -86,7 +86,20 @@ impl PacketBuilder {
 
         let span = trace_span!("send", space = ?space_id, pn = exact_number).entered();
 
-        let number = PacketNumber::new(exact_number, space.largest_acked_packet.unwrap_or(0));
+        let mut number = PacketNumber::new(exact_number, space.largest_acked_packet.unwrap_or(0));
+        let first = conn.config.initial_packet_number;
+        if let Some(&len) = exact_number
+            .checked_sub(first)
+            .and_then(|i| conn.config.packet_number_lengths.get(i as usize))
+        {
+            number = number.at_least(exact_number, usize::from(len));
+        }
+        if conn.config.shared_packet_numbers {
+            for space in conn.spaces.iter_mut() {
+                space.next_packet_number = space.next_packet_number.max(exact_number + 1);
+            }
+        }
+        let space = &conn.spaces[space_id];
         let header = match space_id {
             SpaceId::Data if space.crypto.is_some() => Header::Short {
                 dst_cid,
