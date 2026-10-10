@@ -62,6 +62,7 @@ pub struct TransportConfig {
     pub(crate) initial_datagram_trailing_padding: bool,
     pub(crate) initial_layout: Option<Arc<dyn InitialLayout>>,
     pub(crate) active_connection_id_limit: u32,
+    pub(crate) max_ack_delay: Option<Duration>,
 
     pub(crate) qlog_sink: QlogSink,
 }
@@ -434,6 +435,15 @@ impl TransportConfig {
         self
     }
 
+    /// Maximum time this endpoint delays acknowledging ack-eliciting packets
+    ///
+    /// Advertised as the `max_ack_delay` transport parameter. `None` (the default) uses the
+    /// protocol default of 25 ms. Rounded down to whole milliseconds, at most 2^14 - 1.
+    pub fn max_ack_delay(&mut self, value: Option<Duration>) -> &mut Self {
+        self.max_ack_delay = value.map(|delay| delay.min(Duration::from_millis((1 << 14) - 1)));
+        self
+    }
+
     /// Frame layout of a client's first flight of Initial packets
     ///
     /// `None` (the default) sends the ClientHello as in-order CRYPTO frames followed by PADDING.
@@ -497,6 +507,7 @@ impl Default for TransportConfig {
             initial_datagram_trailing_padding: false,
             initial_layout: None,
             active_connection_id_limit: 5,
+            max_ack_delay: None,
 
             qlog_sink: QlogSink::default(),
         }
@@ -538,6 +549,7 @@ impl fmt::Debug for TransportConfig {
             initial_datagram_trailing_padding,
             initial_layout,
             active_connection_id_limit,
+            max_ack_delay,
             qlog_sink,
         } = self;
         let mut s = fmt.debug_struct("TransportConfig");
@@ -577,7 +589,8 @@ impl fmt::Debug for TransportConfig {
                 initial_datagram_trailing_padding,
             )
             .field("initial_layout", initial_layout)
-            .field("active_connection_id_limit", active_connection_id_limit);
+            .field("active_connection_id_limit", active_connection_id_limit)
+            .field("max_ack_delay", max_ack_delay);
         if cfg!(feature = "qlog") {
             s.field("qlog_stream", &qlog_sink.is_enabled());
         }

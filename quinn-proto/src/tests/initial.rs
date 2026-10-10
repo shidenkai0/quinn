@@ -481,3 +481,17 @@ fn active_connection_id_limit() {
     assert!(held > 5, "{held}");
     assert!(!pair.client_conn_mut(client_ch).is_closed());
 }
+
+#[test]
+fn max_ack_delay() {
+    let _guard = subscribe();
+    let mut transport = TransportConfig::default();
+    transport.max_ack_delay(Some(Duration::from_millis(20)));
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect_with(client_config_with(transport));
+    assert_eq!(pair.server_conn_mut(server_ch).max_ack_delays().0, 20);
+    assert_eq!(
+        pair.client_conn_mut(client_ch).max_ack_delays().1,
+        Duration::from_millis(20)
+    );
+}

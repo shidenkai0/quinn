@@ -342,9 +342,14 @@ impl Connection {
             path_responses: PathResponses::default(),
             close: false,
 
-            ack_frequency: AckFrequencyState::new(get_max_ack_delay(
-                &TransportParameters::default(),
-            )),
+            ack_frequency: {
+                let mut state =
+                    AckFrequencyState::new(get_max_ack_delay(&TransportParameters::default()));
+                if let Some(delay) = config.max_ack_delay {
+                    state.max_ack_delay = delay;
+                }
+                state
+            },
             next_bundled_ack_time: None,
 
             pto_count: 0,
@@ -3187,6 +3192,15 @@ impl Connection {
         }
         self.endpoint_events
             .push_back(EndpointEventInner::NeedIdentifiers(now, n));
+    }
+
+    /// The peer's `max_ack_delay` in milliseconds, and this endpoint's
+    #[cfg(test)]
+    pub(crate) fn max_ack_delays(&self) -> (u64, Duration) {
+        (
+            self.peer_params.max_ack_delay.0,
+            self.ack_frequency.max_ack_delay,
+        )
     }
 
     /// The peer's `active_connection_id_limit`, and the length and occupancy of the window of
