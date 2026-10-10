@@ -48,6 +48,7 @@ pub struct TransportConfig {
     pub(crate) allow_spin: bool,
     pub(crate) unspun_spin_bit: Option<bool>,
     pub(crate) send_ecn: bool,
+    pub(crate) ecn_test_datagrams: Option<u32>,
     pub(crate) keep_alive_with_open_streams_only: bool,
     pub(crate) datagram_receive_buffer_size: Option<usize>,
     pub(crate) datagram_send_buffer_size: usize,
@@ -324,6 +325,21 @@ impl TransportConfig {
         self
     }
 
+    /// Test a path for ECN with a fixed number of marked datagrams (RFC 9000 Appendix A.4)
+    ///
+    /// With `Some(n)`, nothing is marked until the handshake is confirmed; then the next `n`
+    /// datagrams are marked ECT(0) and marking stops until an acknowledgement whose ECN counts
+    /// validate the path (RFC 9000 section 13.4.2) resumes it for good. Missing or inconsistent
+    /// counts, or the first 3 marked packets all being lost, disable ECN on the path. A migrated
+    /// path is tested again.
+    ///
+    /// `None` (the default) marks from the first packet and stops when validation fails. Has no
+    /// effect when [`send_ecn`](Self::send_ecn) is `false`.
+    pub fn ecn_test_datagrams(&mut self, value: Option<u32>) -> &mut Self {
+        self.ecn_test_datagrams = value;
+        self
+    }
+
     /// Maximum number of incoming application datagram bytes to buffer, or None to disable
     /// incoming datagrams
     ///
@@ -525,6 +541,7 @@ impl Default for TransportConfig {
             allow_spin: true,
             unspun_spin_bit: None,
             send_ecn: true,
+            ecn_test_datagrams: None,
             keep_alive_with_open_streams_only: false,
             datagram_receive_buffer_size: Some(STREAM_RWND as usize),
             datagram_send_buffer_size: 1024 * 1024,
@@ -573,6 +590,7 @@ impl fmt::Debug for TransportConfig {
             allow_spin,
             unspun_spin_bit,
             send_ecn,
+            ecn_test_datagrams,
             keep_alive_with_open_streams_only,
             datagram_receive_buffer_size,
             datagram_send_buffer_size,
@@ -616,6 +634,7 @@ impl fmt::Debug for TransportConfig {
             .field("allow_spin", allow_spin)
             .field("unspun_spin_bit", unspun_spin_bit)
             .field("send_ecn", send_ecn)
+            .field("ecn_test_datagrams", ecn_test_datagrams)
             .field(
                 "keep_alive_with_open_streams_only",
                 keep_alive_with_open_streams_only,

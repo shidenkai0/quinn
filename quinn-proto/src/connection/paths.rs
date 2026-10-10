@@ -12,12 +12,44 @@ use crate::{Duration, Instant, TIMER_GRANULARITY, TransportConfig, congestion, p
 #[cfg(feature = "qlog")]
 use qlog::events::quic::MetricsUpdated;
 
+/// Progress of an ECN test (RFC 9000 Appendix A.4), see [`TransportConfig::ecn_test_datagrams`]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EcnTest {
+    /// Waiting for the handshake to be confirmed; nothing is marked
+    NotStarted,
+    /// Marking datagrams; acknowledgements are not validated yet
+    Testing {
+        /// Marked datagrams sent
+        sent: u32,
+        /// Marked packets acknowledged
+        acked: u32,
+        /// Marked packets declared lost
+        lost: u32,
+    },
+    /// Test datagrams sent; nothing is marked until an acknowledgement validates the path
+    Unknown,
+    /// Validated: every datagram is marked
+    Capable,
+    /// Validation failed: nothing is marked
+    Failed,
+}
+
+impl EcnTest {
+    pub(super) const TESTING: Self = Self::Testing {
+        sent: 0,
+        acked: 0,
+        lost: 0,
+    };
+}
+
 /// Description of a particular network path
 pub(super) struct PathData {
     pub(super) remote: SocketAddr,
     pub(super) rtt: RttEstimator,
     /// Whether we're enabling ECN on outgoing packets
     pub(super) sending_ecn: bool,
+    /// ECN test of the path, with [`TransportConfig::ecn_test_datagrams`]; `sending_ecn` follows it
+    pub(super) ecn_test: Option<EcnTest>,
     /// Congestion controller state
     pub(super) congestion: Box<dyn congestion::Controller>,
     /// Pacing state
@@ -70,7 +102,12 @@ impl PathData {
         Self {
             remote,
             rtt: RttEstimator::new(config.initial_rtt),
-            sending_ecn: config.send_ecn,
+            // An ECN test marks nothing until it starts.
+            sending_ecn: config.send_ecn && config.ecn_test_datagrams.is_none(),
+            ecn_test: config
+                .ecn_test_datagrams
+                .filter(|_| config.send_ecn)
+                .map(|_| EcnTest::NotStarted),
             pacing: Pacer::new(
                 config.initial_rtt,
                 congestion.initial_window(),
@@ -120,6 +157,8 @@ impl PathData {
             rtt: prev.rtt,
             pacing: Pacer::new(smoothed_rtt, congestion.window(), prev.current_mtu(), now),
             sending_ecn: true,
+            // A migrated path is tested again.
+            ecn_test: prev.ecn_test.map(|_| EcnTest::TESTING),
             congestion,
             challenge: None,
             challenge_pending: false,
@@ -133,6 +172,15 @@ impl PathData {
             #[cfg(feature = "qlog")]
             recovery_metrics: prev.recovery_metrics.clone(),
             generation,
+        }
+    }
+
+    /// Moves the path's ECN test to `state` and marks accordingly
+    pub(super) fn set_ecn_test(&mut self, state: EcnTest) {
+        if self.ecn_test.is_some() {
+            trace!(?state, "ECN test");
+            self.sending_ecn = matches!(state, EcnTest::Testing { .. } | EcnTest::Capable);
+            self.ecn_test = Some(state);
         }
     }
 

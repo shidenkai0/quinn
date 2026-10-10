@@ -583,6 +583,58 @@ fn send_ecn() {
     }
 }
 
+/// Client datagrams of a connection with a 10-datagram ECN test that then sends 40 stream writes
+fn ecn_tested_datagrams(send_ecn: bool, bleach: bool) -> Vec<(Option<EcnCodepoint>, Bytes)> {
+    let mut transport = TransportConfig::default();
+    transport.send_ecn(send_ecn).ecn_test_datagrams(Some(10));
+    let mut pair = Pair::default();
+    pair.bleach_ecn = bleach;
+    let client_ch = pair.begin_connect(client_config_with(transport));
+    let mut datagrams = drive_capturing(&mut pair);
+    let server_ch = pair.server.assert_accept();
+    pair.finish_connect(client_ch, server_ch);
+    let stream = pair.client_streams(client_ch).open(Dir::Uni).unwrap();
+    for _ in 0..40 {
+        pair.client_send(client_ch, stream)
+            .write(&[0; 100])
+            .unwrap();
+        datagrams.extend(drive_capturing(&mut pair));
+    }
+    datagrams
+}
+
+#[test]
+fn ecn_test_datagrams() {
+    let _guard = subscribe();
+    let marked = |datagrams: &[(Option<EcnCodepoint>, Bytes)]| {
+        datagrams
+            .iter()
+            .enumerate()
+            .filter(|(_, (ecn, _))| *ecn == Some(EcnCodepoint::Ect0))
+            .map(|(i, (_, data))| {
+                assert_eq!(data[0] & 0x80, 0, "only short-header datagrams are marked");
+                i
+            })
+            .collect::<Vec<_>>()
+    };
+
+    // A path that clears the marks: the 10 test datagrams, in a row, then none.
+    let datagrams = ecn_tested_datagrams(true, true);
+    let tested = marked(&datagrams);
+    assert_eq!(tested.len(), 10, "{tested:?}");
+    assert_eq!(tested[9] - tested[0], 9, "consecutive: {tested:?}");
+    assert!(datagrams.len() > tested[9] + 10, "datagrams after the test");
+
+    // A path whose counts validate: marking resumes after the test and continues.
+    let datagrams = ecn_tested_datagrams(true, false);
+    let validated = marked(&datagrams);
+    assert!(validated.len() > 20, "{validated:?}");
+    assert_eq!(validated.last(), Some(&(datagrams.len() - 1)));
+
+    // `send_ecn(false)` wins.
+    assert!(marked(&ecn_tested_datagrams(false, false)).is_empty());
+}
+
 /// Run a good while past the idle timeout with an open stream; whether the client survived
 fn survives_idle(open: Dir) -> bool {
     const IDLE_TIMEOUT: u64 = 10;

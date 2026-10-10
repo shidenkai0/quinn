@@ -241,6 +241,7 @@ impl PacketBuilder {
             time_sent: now,
             size,
             ack_eliciting,
+            ecn: conn.path.sending_ecn,
             retransmits: sent.retransmits,
             stream_frames: sent.stream_frames,
         };

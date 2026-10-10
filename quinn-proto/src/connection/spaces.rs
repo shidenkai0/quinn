@@ -291,6 +291,8 @@ pub(super) struct SentPacket {
     pub(super) size: u16,
     /// Whether an acknowledgement is expected directly in response to this packet.
     pub(super) ack_eliciting: bool,
+    /// Whether the packet was sent in an ECT(0)-marked datagram
+    pub(super) ecn: bool,
     /// The largest packet number acknowledged by this packet
     pub(super) largest_acked: Option<u64>,
     /// Data which needs to be retransmitted in case the packet is lost.

@@ -37,6 +37,8 @@ pub(super) struct Pair {
     pub(super) mtu: usize,
     /// Simulates explicit congestion notification
     pub(super) congestion_experienced: bool,
+    /// Simulates a path that clears the ECN codepoint of the client's datagrams
+    pub(super) bleach_ecn: bool,
     // One-way
     pub(super) latency: Duration,
     /// Number of spin bit flips
@@ -85,6 +87,7 @@ impl Pair {
             spins: 0,
             last_spin: false,
             congestion_experienced: false,
+            bleach_ecn: false,
         }
     }
 
@@ -156,7 +159,8 @@ impl Pair {
                 socket.send_to(&buffer, packet.destination).unwrap();
             }
             if self.server.addr == packet.destination {
-                let ecn = set_congestion_experienced(packet.ecn, self.congestion_experienced);
+                let ecn = set_congestion_experienced(packet.ecn, self.congestion_experienced)
+                    .filter(|_| !self.bleach_ecn);
                 self.server.inbound.push_back((
                     self.time + self.latency,
                     ecn,

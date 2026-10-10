@@ -61,7 +61,7 @@ use packet_crypto::{PrevCrypto, ZeroRttCrypto};
 
 mod paths;
 pub use paths::RttEstimator;
-use paths::{PathData, PathResponses};
+use paths::{EcnTest, PathData, PathResponses};
 
 pub(crate) mod qlog;
 
@@ -1043,14 +1043,18 @@ impl Connection {
 
         self.stats.udp_tx.on_sent(num_datagrams as u64, buf.len());
 
+        let ecn = self.path.sending_ecn.then_some(EcnCodepoint::Ect0);
+        if let Some(EcnTest::Testing { sent, .. }) = &mut self.path.ecn_test {
+            *sent = sent.saturating_add(num_datagrams as u32);
+            if *sent >= self.config.ecn_test_datagrams.unwrap_or(0) {
+                self.path.set_ecn_test(EcnTest::Unknown);
+            }
+        }
+
         Some(Transmit {
             destination: self.path.remote,
             size: buf.len(),
-            ecn: if self.path.sending_ecn {
-                Some(EcnCodepoint::Ect0)
-            } else {
-                None
-            },
+            ecn,
             segment_size: match num_datagrams {
                 1 => None,
                 _ => Some(segment_size),
@@ -1550,8 +1554,10 @@ impl Connection {
         }
 
         let mut ack_eliciting_acked = false;
+        let mut ecn_acked = 0u64;
         for packet in newly_acked.elts() {
             if let Some(info) = self.spaces[space].take(packet) {
+                ecn_acked += u64::from(info.ecn);
                 if let Some(acked) = info.largest_acked {
                     // Assume ACKs for all packets below the largest acknowledged in `packet` have
                     // been received. This can cause the peer to spuriously retransmit if some of
@@ -1609,7 +1615,9 @@ impl Connection {
         }
 
         // Explicit congestion notification
-        if self.path.sending_ecn {
+        if self.path.ecn_test.is_some() {
+            self.on_ecn_test_ack(now, space, new_largest, ecn_acked, ack.ecn);
+        } else if self.path.sending_ecn {
             if let Some(ecn) = ack.ecn {
                 // We only examine ECN counters from ACKs that we are certain we received in transmit
                 // order, allowing us to compute an increase in ECN counts to compare against the number
@@ -1628,6 +1636,71 @@ impl Connection {
 
         self.set_loss_detection_timer(now);
         Ok(())
+    }
+
+    /// Starts the path's ECN test, once the handshake is confirmed
+    fn start_ecn_test(&mut self) {
+        if self.path.ecn_test == Some(EcnTest::NotStarted) {
+            self.path.set_ecn_test(EcnTest::TESTING);
+        }
+    }
+
+    /// Advances the path's ECN test with an ACK frame that newly acknowledges `ecn_acked` marked
+    /// packets (RFC 9000 section 13.4.2.1, as neqo applies it)
+    fn on_ecn_test_ack(
+        &mut self,
+        now: Instant,
+        space: SpaceId,
+        new_largest: bool,
+        ecn_acked: u64,
+        counts: Option<frame::EcnCounts>,
+    ) {
+        match &mut self.path.ecn_test {
+            Some(EcnTest::Testing { acked, .. }) => {
+                // Counts are validated once the test datagrams are out.
+                *acked = acked.saturating_add(ecn_acked as u32);
+                return;
+            }
+            Some(EcnTest::Unknown | EcnTest::Capable) if new_largest => {}
+            _ => return,
+        }
+        let Some(counts) = counts else {
+            debug!("ECN test failed: no ECN counts");
+            self.path.set_ecn_test(EcnTest::Failed);
+            return;
+        };
+        let baseline = self.spaces[space].ecn_feedback;
+        let ect0 = counts.ect0.saturating_sub(baseline.ect0);
+        let ect1 = counts.ect1.saturating_sub(baseline.ect1);
+        let ce = counts.ce.saturating_sub(baseline.ce);
+        self.spaces[space].ecn_feedback = counts;
+        if ect0 + ce < ecn_acked {
+            debug!("ECN test failed: fewer marks counted than marked packets acknowledged");
+            self.path.set_ecn_test(EcnTest::Failed);
+        } else if ect1 != 0 {
+            debug!("ECN test failed: ECT(1) counted but never sent");
+            self.path.set_ecn_test(EcnTest::Failed);
+        } else {
+            self.path.set_ecn_test(EcnTest::Capable);
+            if ce != 0 {
+                self.stats.path.congestion_events += 1;
+                let sent = self.spaces[space].largest_acked_packet_sent;
+                self.path
+                    .congestion
+                    .on_congestion_event(now, sent, false, 0);
+            }
+        }
+    }
+
+    /// A marked packet was lost: the first marked packets all being lost means the path drops them
+    fn on_ecn_test_loss(&mut self) {
+        if let Some(EcnTest::Testing { acked: 0, lost, .. }) = &mut self.path.ecn_test {
+            *lost += 1;
+            if *lost >= ECN_TEST_LOSSES {
+                debug!("ECN test failed: the first marked packets were all lost");
+                self.path.set_ecn_test(EcnTest::Failed);
+            }
+        }
     }
 
     /// Process a new ECN block from an in-order ACK
@@ -1824,6 +1897,9 @@ impl Connection {
 
             for &packet in &lost_packets {
                 let info = self.spaces[pn_space].take(packet).unwrap(); // safe: lost_packets is populated just above
+                if info.ecn {
+                    self.on_ecn_test_loss();
+                }
                 self.config.qlog_sink.emit_packet_lost(
                     packet,
                     &info,
@@ -2660,6 +2736,7 @@ impl Connection {
                     // Server-only
                     self.spaces[SpaceId::Data].pending.handshake_done = true;
                     self.discard_space(now, SpaceId::Handshake);
+                    self.start_ecn_test();
                 }
 
                 self.events.push_back(Event::Connected);
@@ -3063,6 +3140,7 @@ impl Connection {
                     if self.spaces[SpaceId::Handshake].crypto.is_some() {
                         self.discard_space(now, SpaceId::Handshake);
                     }
+                    self.start_ecn_test();
                 }
             }
         }
@@ -4269,6 +4347,9 @@ const MAX_HANDSHAKE_OR_0RTT_HEADER_SIZE: usize =
 ///
 /// Chosen arbitrarily, intended to be large enough to prevent spurious connection loss.
 const KEY_UPDATE_MARGIN: u64 = 10_000;
+
+/// Marked packets lost, with none acknowledged, after which an ECN test fails
+const ECN_TEST_LOSSES: u32 = 3;
 
 /// Progress of a client's planned first flight (see [`crate::InitialLayout`])
 enum InitialPlan {
